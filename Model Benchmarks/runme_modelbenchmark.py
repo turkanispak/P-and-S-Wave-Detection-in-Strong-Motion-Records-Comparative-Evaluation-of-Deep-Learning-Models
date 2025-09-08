@@ -117,6 +117,7 @@ def pick_phases_from_mat(mat_path, model_dict, preds_root):
             s_time = round(s_sec, 3)
 
             if isinstance(cls_logits, torch.Tensor) and cls_logits.ndim >= 2 and cls_logits.shape[0] >= 1:
+                # Standard classification for all models (including TimesNet)
                 cls_idx = int(torch.argmax(cls_logits, dim=1).item())
                 cls_label = CLASS_LABELS[cls_idx] if 0 <= cls_idx < len(CLASS_LABELS) else f"class{cls_idx}"
             else:
@@ -130,7 +131,13 @@ def pick_phases_from_mat(mat_path, model_dict, preds_root):
     # Collect grouped keys so we can save under RESNET / CONV_LSTM / CNN_LSTM / etc.
     # Group name rule: "RESNET_15" -> "RESNET"; "RESNET30" -> "RESNET"; else group is the key itself.
     def group_name_from_key(k: str) -> str:
-        return "RESNET" if k.upper().startswith("RESNET") else k
+        ku = k.upper()
+        if ku.startswith("RESNET"):
+            return "RESNET"
+        elif ku.startswith("TIMESNET"):
+            return "TIMESNET"
+        else:
+            return k
 
     # First pass: RESNET special handling (choose correct 15/30/60/100 model by data length)
     if any(k.upper().startswith("RESNET") for k in model_dict.keys()):
@@ -208,10 +215,90 @@ def pick_phases_from_mat(mat_path, model_dict, preds_root):
         else:
             print(f"  [WARN] No matching RESNET model for {sample_len_s}s sample. Skipping RESNET.")
 
-    # Second pass: all OTHER models (e.g., CONV_LSTM, CNN_LSTM, TIMESNET, etc.)
+    # Second pass: TIMESNET special handling (same logic as RESNET)
+    if any(k.upper().startswith("TIMESNET") for k in model_dict.keys()):
+        # Find the key that matches the length (e.g., contains '15' / '30' / '60' / '100')
+        target_key = None
+        for k in model_dict.keys():
+            ku = k.upper()
+            if not ku.startswith("TIMESNET"):
+                continue
+            if str(sample_len_s) in ku:
+                target_key = k
+                break
+
+        if target_key is not None:
+            timesnet_entry = model_dict[target_key]
+            timesnet_group = group_name_from_key(target_key)
+            out_dir = os.path.join(preds_root, timesnet_group)
+            os.makedirs(out_dir, exist_ok=True)
+
+            result = run_single_model(
+                model_entry=timesnet_entry,
+                expected_seq_len=total_samples  # must match exactly; no padding/resizing
+            )
+            if result is not None:
+                p_time_cand, s_time_cand, cls_label, model_name = result
+                
+                # Standard processing for all models (including TimesNet)
+                p_time = p_time_cand
+                s_time = s_time_cand
+            
+                # ground truths from MAT
+                p_gt = getattr(record, "p_true", -1)
+                s_gt = getattr(record, "s_true", -1)
+                try: p_gt = float(p_gt)
+                except: p_gt = -1.0
+                try: s_gt = float(s_gt)
+                except: s_gt = -1.0
+            
+                # ---- Plot + Save ----
+                time_axis = np.arange(total_samples) / sr
+                plt.figure(figsize=(12, 5))
+                for ch in range(3):
+                    plt.plot(time_axis, accel[:, ch], label=f'Ch{ch}')
+            
+                # GT lines: solid
+                if p_gt >= 0:
+                    plt.axvline(p_gt, color="red",  linestyle="-",  linewidth=2, label=f"GT P: {p_gt:.2f}s")
+                if s_gt >= 0:
+                    plt.axvline(s_gt, color="blue", linestyle="-",  linewidth=2, label=f"GT S: {s_gt:.2f}s")
+            
+                # Predicted lines: dashed
+                if p_time is not None and p_time >= 0:
+                    plt.axvline(p_time, color="red",  linestyle="--", linewidth=2, label=f"Pred P: {p_time:.2f}s")
+                if s_time is not None and s_time >= 0:
+                    plt.axvline(s_time, color="blue", linestyle="--", linewidth=2, label=f"Pred S: {s_time:.2f}s")
+            
+                plt.title(f"{record_name} — {model_name} ({sample_len_s}s) — Type: {cls_label}")
+                plt.xlabel("Time (s)")
+                plt.ylabel("Amplitude")
+                plt.grid(True, axis='x', linestyle='--', alpha=0.3)
+                plt.legend()
+                plt.tight_layout()
+            
+                safe_model = "".join(c if c.isalnum() or c in "._-" else "_" for c in model_name)
+                plot_fname = f"{record_name}_{sample_len_s}s_{safe_model}_{cls_label}.png"
+                plot_path = os.path.join(out_dir, plot_fname)
+                plt.savefig(plot_path, dpi=150)
+                plt.close()
+            
+                # Handle -999 (None) values for display
+                p_display = "None" if p_time < 0 else f"{p_time:.3f}"
+                s_display = "None" if s_time < 0 else f"{s_time:.3f}"
+                
+                print(
+                    f"  [TIMESNET] GT(P,S)=({p_gt:.3f},{s_gt:.3f}) "
+                    f"Pred=({p_display},{s_display}) "
+                    f"Type={cls_label} -> {plot_path}"
+                )
+        else:
+            print(f"  [WARN] No matching TIMESNET model for {sample_len_s}s sample. Skipping TIMESNET.")
+
+    # Third pass: all OTHER models (e.g., CONV_LSTM, CNN_LSTM, etc.)
     for key, entry in model_dict.items():
         ku = key.upper()
-        if ku.startswith("RESNET"):
+        if ku.startswith("RESNET") or ku.startswith("TIMESNET"):
             continue  # already handled above
 
         group = group_name_from_key(key)
@@ -314,15 +401,19 @@ if __name__ == "__main__":
 
     # Register models here
     model_dict = {
-        "RESNET15":  {"name": "ResNet1D_15",  "hf_repo": "yek-models/resnet1d-pspicker", "hf_filename": "resnet_15.torchscript"},
-        "RESNET30":  {"name": "ResNet1D_30",  "hf_repo": "yek-models/resnet1d-pspicker", "hf_filename": "resnet_30.torchscript"},
-        "RESNET60":  {"name": "ResNet1D_60",  "hf_repo": "yek-models/resnet1d-pspicker", "hf_filename": "resnet_60.torchscript"},
-        "RESNET100": {"name": "ResNet1D_100", "hf_repo": "yek-models/resnet1d-pspicker", "hf_filename": "resnet_100.torchscript"},
+        "RESNET15":  {"name": "ResNet1D_15",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "resnet_15.torchscript"},
+        "RESNET30":  {"name": "ResNet1D_30",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "resnet_30.torchscript"},
+        "RESNET60":  {"name": "ResNet1D_60",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "resnet_60.torchscript"},
+        "RESNET100": {"name": "ResNet1D_100", "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "resnet_100.torchscript"},
     
+        "TIMESNET15":  {"name": "TimesNet_PS_15",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "timesnet_15.torchscript"},
+        "TIMESNET30":  {"name": "TimesNet_PS_30",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "timesnet_30.torchscript"},
+        "TIMESNET60":  {"name": "TimesNet_PS_60",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "timesnet_60.torchscript"},
+        "TIMESNET100": {"name": "TimesNet_PS_100", "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "timesnet_100.torchscript"},
+        
         # Register remaining models below
         #"CONV_LSTM": {"name": "CONV_LSTM_MODEL", "hf_repo": "jane-doe/repo-name", "hf_filename": "modelname.torchscript"},
         #"CNN_LSTM": {"name": "CNN_LSTM_MODEL", "hf_repo": "jane-doe/repo-name", "hf_filename": "modelname.torchscript"},
-        #"TIMESNET": {"name": "TIMESNET_MODEL", "hf_repo": "john-doe/repo-name", "hf_filename": "modelname.torchscript"},
     }
 
 
