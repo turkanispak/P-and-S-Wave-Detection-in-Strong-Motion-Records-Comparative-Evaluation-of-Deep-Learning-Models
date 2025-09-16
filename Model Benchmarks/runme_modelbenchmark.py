@@ -112,6 +112,10 @@ def pick_phases_from_mat(mat_path, model_dict, preds_root):
         if model_type == "cnn_lstm":
             # CNN-LSTM specific preprocessing using your dataloader logic
             x = prepare_cnn_lstm_input(accel, model_entry)
+        elif model_type == "conv_lstm":
+            model = model.to('cpu')
+            x = prepare_convlstm_input(accel, model_entry)
+            x = x.to('cpu')
         else:
             # Standard preprocessing (existing)
             x = torch.tensor(accel.T, dtype=torch.float32).unsqueeze(0).to(device)  # [1, 3, N]
@@ -121,6 +125,8 @@ def pick_phases_from_mat(mat_path, model_dict, preds_root):
             if model_type == "cnn_lstm":
                 # CNN-LSTM models return predictions for each window, need to aggregate
                 p_time, s_time, cls_label = run_cnn_lstm_inference(model, x, model_entry)
+            elif model_type == "conv_lstm":
+                p_time, s_time, cls_label = run_convlstm_inference(model, x, model_entry)
             else:
                 # Standard model inference
                 p_local, s_local, cls_logits = model(x)
@@ -137,6 +143,36 @@ def pick_phases_from_mat(mat_path, model_dict, preds_root):
                     cls_label = "NA"
 
         return (p_time, s_time, cls_label, model_name)
+    
+    # Helper function for ConvLSTM input preparation
+    def prepare_convlstm_input(accel, model_entry):
+        """
+        Prepare input for ConvLSTM models using your windowing approach.
+        Returns shape [1, num_windows, 3, 1, window_size].
+        """
+        window_size = model_entry.get("window_size")
+        hopping_size = model_entry.get("hopping_size")
+
+        accel_tensor = torch.tensor(accel, dtype=torch.float32)
+        accel_tensor = zero_center_normalize(accel_tensor)
+
+        windows = []
+        num_steps = accel_tensor.shape[0] - window_size + 1
+        for start_idx in range(0, num_steps, hopping_size):
+            end_idx = start_idx + window_size
+            if end_idx > accel_tensor.shape[0]:
+                break
+            w = accel_tensor[start_idx:end_idx, :].T  # [3, window_size]
+            w = w.unsqueeze(1)  # [3, 1, window_size]
+            windows.append(w)
+
+        if len(windows) == 0:
+            return torch.zeros(1, 1, 3, 1, window_size, device=device)
+
+        x = torch.stack(windows, dim=0).to(device)      # [num_windows, 3, 1, window_size]
+        x = x.unsqueeze(0)                              # [1, num_windows, 3, 1, window_size]
+        return x
+
 
     # Helper function for CNN-LSTM input preparation
     def prepare_cnn_lstm_input(accel, model_entry):
@@ -175,6 +211,58 @@ def pick_phases_from_mat(mat_path, model_dict, preds_root):
         x = x.unsqueeze(0)
         
         return x
+
+
+    # Helper function for ConvLSTM inference
+    def run_convlstm_inference(model, x, model_entry):
+        """
+        Run ConvLSTM model and aggregate predictions.
+        Model output shape: [1, num_windows, 6]
+            [0] P index
+            [1] S index
+            [2:6] class logits
+        """
+        print("x device:", x.device)
+        for p in model.parameters():
+            print("model param device:", p.device)
+            break
+
+        predictions = model(x)  # [1, num_windows, 6]
+        predictions = predictions.squeeze(0)  # [num_windows, 6]
+
+        p_indices = predictions[:, 0]
+        s_indices = predictions[:, 1]
+        cls_logits = predictions[:, 2:6]  # 4-class softmax
+
+        sr = 100
+
+        # ---- P wave aggregation ----
+        valid_p = p_indices[p_indices >= 0]
+        if len(valid_p) > 0:
+            # Hem ortalama hem medyan kullanılabilir; burada ortalama verdim.
+            p_time = round(float(valid_p.mean().item() / sr), 3)
+            # Alternatif: median
+            # p_time = round(float(valid_p.median().item() / sr), 3)
+        else:
+            p_time = None
+
+        # ---- S wave aggregation ----
+        valid_s = s_indices[s_indices >= 0]
+        if len(valid_s) > 0:
+            s_time = round(float(valid_s.mean().item() / sr), 3)
+            # Alternatif: median
+            # s_time = round(float(valid_s.median().item() / sr), 3)
+        else:
+            s_time = None
+
+        # ---- Classification: map {0:"1N",1:"2NP",2:"2NPS",3:"2NPS"} ----
+        cls_idx = int(torch.argmax(cls_logits.mean(dim=0)).item())
+        cls_map = {0: "1N", 1: "2NP", 2: "2NPS", 3: "2NPS"}
+        cls_label = cls_map.get(cls_idx, "NA")
+
+        return p_time, s_time, cls_label
+
+
 
     # Helper function for CNN-LSTM inference with confidence-based aggregation
     def run_cnn_lstm_inference(model, x, model_entry):
@@ -275,6 +363,8 @@ def pick_phases_from_mat(mat_path, model_dict, preds_root):
             return "TIMESNET"
         elif ku.startswith("CNN_LSTM"):
             return "CNN_LSTM"
+        elif ku.startswith("CONV_LSTM"):
+            return "CONV_LSTM"
         else:
             return k
 
@@ -511,10 +601,89 @@ def pick_phases_from_mat(mat_path, model_dict, preds_root):
         else:
             print(f"  [WARN] No matching CNN_LSTM model for {sample_len_s}s sample. Skipping CNN_LSTM.")
 
-    # Fourth pass: all OTHER models (e.g., CONV_LSTM, etc.)
+
+        # Fourth pass: CONV_LSTM special handling
+    if any(k.upper().startswith("CONV_LSTM") for k in model_dict.keys()):
+        # Find the key that matches the length (e.g., contains '15' / '30' / '60' / '100')
+        target_key = None
+        for k in model_dict.keys():
+            ku = k.upper()
+            if not ku.startswith("CONV_LSTM"):
+                continue
+            if str(sample_len_s) in ku:
+                target_key = k
+                break
+
+        if target_key is not None:
+            convlstm_entry = model_dict[target_key]
+            convlstm_group = group_name_from_key(target_key)
+            out_dir = os.path.join(preds_root, convlstm_group)
+            os.makedirs(out_dir, exist_ok=True)
+
+            result = run_single_model(
+                model_entry=convlstm_entry,
+                expected_seq_len=None,  # ConvLSTM accepts varying lengths
+                model_type=convlstm_entry.get("model_type", "conv_lstm")
+            )
+            if result is not None:
+                p_time_cand, s_time_cand, cls_label, model_name = result
+
+                # Apply masking
+                p_time, s_time, mask_note = _mask_regression_by_cls(cls_label, p_time_cand, s_time_cand)
+
+                # Ground truths
+                p_gt = getattr(record, "p_true", -1)
+                s_gt = getattr(record, "s_true", -1)
+                try: p_gt = float(p_gt)
+                except: p_gt = -1.0
+                try: s_gt = float(s_gt)
+                except: s_gt = -1.0
+
+                # ---- Plot + Save ----
+                time_axis = np.arange(total_samples) / sr
+                plt.figure(figsize=(12, 5))
+                for ch in range(3):
+                    plt.plot(time_axis, accel[:, ch], label=f'Ch{ch}')
+
+                # GT lines
+                if p_gt >= 0:
+                    plt.axvline(p_gt, color="red",  linestyle="-",  linewidth=2, label=f"GT P: {p_gt:.2f}s")
+                if s_gt >= 0:
+                    plt.axvline(s_gt, color="blue", linestyle="-",  linewidth=2, label=f"GT S: {s_gt:.2f}s")
+
+                # Predicted lines
+                if p_time is not None and p_time >= 0:
+                    plt.axvline(p_time, color="red",  linestyle="--", linewidth=2, label=f"Pred P: {p_time:.2f}s")
+                if s_time is not None and s_time >= 0:
+                    plt.axvline(s_time, color="blue", linestyle="--", linewidth=2, label=f"Pred S: {s_time:.2f}s")
+
+                plt.title(f"{record_name} — {model_name} ({sample_len_s}s) — Type: {cls_label}")
+                plt.xlabel("Time (s)")
+                plt.ylabel("Amplitude")
+                plt.grid(True, axis='x', linestyle='--', alpha=0.3)
+                plt.legend()
+                plt.tight_layout()
+
+                safe_model = "".join(c if c.isalnum() or c in "._-" else "_" for c in model_name)
+                plot_fname = f"{record_name}_{sample_len_s}s_{safe_model}_{cls_label}.png"
+                plot_path = os.path.join(out_dir, plot_fname)
+                plt.savefig(plot_path, dpi=150)
+                plt.close()
+
+                print(
+                    f"  [CONV_LSTM] GT(P,S)=({p_gt},{s_gt}) "
+                    f"Pred=({p_time},{s_time}) "
+                    f"Type={cls_label} {'['+mask_note+']' if mask_note else ''} -> {plot_path}"
+                )
+        else:
+            print(f"  [WARN] No matching CONV_LSTM model for {sample_len_s}s sample. Skipping CONV_LSTM.")
+
+
+
+    # Fifth pass: all OTHER models (e.g., CONV_LSTM, etc.)
     for key, entry in model_dict.items():
         ku = key.upper()
-        if ku.startswith("RESNET") or ku.startswith("TIMESNET") or ku.startswith("CNN_LSTM"):
+        if ku.startswith("RESNET") or ku.startswith("TIMESNET") or ku.startswith("CNN_LSTM") or ku.startswith("CONV_LSTM"):
             continue  # already handled above
 
         group = group_name_from_key(key)
@@ -619,49 +788,80 @@ if __name__ == "__main__":
     # Register models here
     model_dict = {
 
-        "RESNET15":  {"name": "ResNet1D_15",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "resnet_15.torchscript"},
-        "RESNET30":  {"name": "ResNet1D_30",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "resnet_30.torchscript"},
-        "RESNET60":  {"name": "ResNet1D_60",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "resnet_60.torchscript"},
-        "RESNET100": {"name": "ResNet1D_100", "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "resnet_100.torchscript"},
+        # "RESNET15":  {"name": "ResNet1D_15",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "resnet_15.torchscript"},
+        # "RESNET30":  {"name": "ResNet1D_30",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "resnet_30.torchscript"},
+        # "RESNET60":  {"name": "ResNet1D_60",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "resnet_60.torchscript"},
+        # "RESNET100": {"name": "ResNet1D_100", "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "resnet_100.torchscript"},
     
-        "TIMESNET15":  {"name": "TimesNet_PS_15",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "timesnet_15.torchscript"},
-        "TIMESNET30":  {"name": "TimesNet_PS_30",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "timesnet_30.torchscript"},
-        "TIMESNET60":  {"name": "TimesNet_PS_60",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "timesnet_60.torchscript"},
-        "TIMESNET100": {"name": "TimesNet_PS_100", "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "timesnet_100.torchscript"},
+        # "TIMESNET15":  {"name": "TimesNet_PS_15",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "timesnet_15.torchscript"},
+        # "TIMESNET30":  {"name": "TimesNet_PS_30",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "timesnet_30.torchscript"},
+        # "TIMESNET60":  {"name": "TimesNet_PS_60",  "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "timesnet_60.torchscript"},
+        # "TIMESNET100": {"name": "TimesNet_PS_100", "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", "hf_filename": "timesnet_100.torchscript"},
        
-        # CNN-LSTM models with your custom preprocessing
-        "CNN_LSTM_15": {
-            "name": "CNN_LSTM_15s", 
-            "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", 
-            "hf_filename": "cnn_lstm_15.torchscript",
-            "model_type": "cnn_lstm",
-            "window_size": 900,  # 9 seconds * 100Hz
-            "hopping_size": 300,  # 3 seconds * 100Hz
+        # # CNN-LSTM models with your custom preprocessing
+        # "CNN_LSTM_15": {
+        #     "name": "CNN_LSTM_15s", 
+        #     "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", 
+        #     "hf_filename": "cnn_lstm_15.torchscript",
+        #     "model_type": "cnn_lstm",
+        #     "window_size": 900,  # 9 seconds * 100Hz
+        #     "hopping_size": 300,  # 3 seconds * 100Hz
+        # },
+        # "CNN_LSTM_30": {
+        #     "name": "CNN_LSTM_30s", 
+        #     "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", 
+        #     "hf_filename": "cnn_lstm_30.torchscript",
+        #     "model_type": "cnn_lstm",
+        #     "window_size": 900,  # 9 seconds * 100Hz
+        #     "hopping_size": 300,  # 3 seconds * 100Hz
+        # },
+        # "CNN_LSTM_60": {
+        #     "name": "CNN_LSTM_60s", 
+        #     "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", 
+        #     "hf_filename": "cnn_lstm_60.torchscript",
+        #     "model_type": "cnn_lstm",
+        #     "window_size": 900,  # 9 seconds * 100Hz
+        #     "hopping_size": 300,  # 3 seconds * 100Hz
+        # },
+        # "CNN_LSTM_100": {
+        #     "name": "CNN_LSTM_100s", 
+        #     "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", 
+        #     "hf_filename": "cnn_lstm_100.torchscript",
+        #     "model_type": "cnn_lstm",
+        #     "window_size": 900,  # 9 seconds * 100Hz
+        #     "hopping_size": 300,  # 3 seconds * 100Hz
+        # },
+
+        # ConvLSTM models with custom preprocessing
+        "CONV_LSTM_15": {
+            "name": "ConvLSTM_15s",
+            "weights": "/home/hekimoglu/workspace/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models/convlstm_torchscript_models/updated/convlstm_15.torchscript",   # local file under Models/
+            "model_type": "conv_lstm",
+            "window_size": 900,
+            "hopping_size": 300,
         },
-        "CNN_LSTM_30": {
-            "name": "CNN_LSTM_30s", 
-            "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", 
-            "hf_filename": "cnn_lstm_30.torchscript",
-            "model_type": "cnn_lstm",
-            "window_size": 900,  # 9 seconds * 100Hz
-            "hopping_size": 300,  # 3 seconds * 100Hz
+        "CONV_LSTM_30": {
+            "name": "ConvLSTM_30s",
+            "weights": "/home/hekimoglu/workspace/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models/convlstm_torchscript_models/updated/convlstm_30.torchscript",
+            "model_type": "conv_lstm",
+            "window_size": 900,
+            "hopping_size": 300,
         },
-        "CNN_LSTM_60": {
-            "name": "CNN_LSTM_60s", 
-            "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", 
-            "hf_filename": "cnn_lstm_60.torchscript",
-            "model_type": "cnn_lstm",
-            "window_size": 900,  # 9 seconds * 100Hz
-            "hopping_size": 300,  # 3 seconds * 100Hz
+        "CONV_LSTM_60": {
+            "name": "ConvLSTM_60s",
+            "weights": "/home/hekimoglu/workspace/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models/convlstm_torchscript_models/updated/convlstm_60.torchscript",
+            "model_type": "conv_lstm",
+            "window_size": 3000,
+            "hopping_size": 500,
         },
-        "CNN_LSTM_100": {
-            "name": "CNN_LSTM_100s", 
-            "hf_repo": "yek-models/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models", 
-            "hf_filename": "cnn_lstm_100.torchscript",
-            "model_type": "cnn_lstm",
-            "window_size": 900,  # 9 seconds * 100Hz
-            "hopping_size": 300,  # 3 seconds * 100Hz
+        "CONV_LSTM_100": {
+            "name": "ConvLSTM_100s",
+            "weights": "/home/hekimoglu/workspace/P-and-S-Wave-Detection-in-Strong-Motion-Records-Comparative-Evaluation-of-Deep-Learning-Models/convlstm_torchscript_models/updated/convlstm_100.torchscript",
+            "model_type": "conv_lstm",
+            "window_size": 5000,
+            "hopping_size": 1000,
         },
+
         
         # Register remaining models below
         #"CONV_LSTM": {"name": "CONV_LSTM_MODEL", "hf_repo": "jane-doe/repo-name", "hf_filename": "modelname.torchscript"},
